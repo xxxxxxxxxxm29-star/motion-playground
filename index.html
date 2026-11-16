@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Motion Playground</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background:#0b1020; color:#e5e7eb;
+           display:grid; place-items:center; min-height:100vh; margin:0; }
+    .card { width:min(480px,92vw); padding:28px; border-radius:20px;
+            background:#111827; border:1px solid #1f2937; }
+    h1 { margin:0 0 12px; }
+    code { background:#0f172a; padding:2px 6px; border-radius:6px; font-size:13px; }
+    .ok { color:#34d399; }
+    .err { color:#f87171; }
+    button { padding:12px 18px; border-radius:12px; border:0; background:#ef4444;
+             color:white; font-weight:700; cursor:pointer; margin-top:16px; }
+    pre { background:#0f172a; padding:12px; border-radius:12px; overflow:auto;
+          font-size:12px; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>Motion Playground ✅</h1>
+  <p>Вы успешно вошли. JWT сохранён в <code>sessionStorage</code>.</p>
+  <p id="who">Проверяю токен…</p>
+  <pre id="tokenPreview"></pre>
+  <button id="logout">Выйти</button>
+</div>
+<script>
+const token = sessionStorage.getItem("jwt");
+const who = document.getElementById("who");
+const preview = document.getElementById("tokenPreview");
+
+if (!token) {
+  who.innerHTML = '<span class="err">Токена нет — редирект на /login…</span>';
+  setTimeout(() => location.href = "/login", 800);
+} else {
+  preview.textContent = "JWT: " + token.slice(0, 40) + "…";
+  fetch("/auth/me", { headers: { "Authorization": "Bearer " + token } })
+    .then(r => r.json())
+    .then(d => {
+      if (d.email) who.innerHTML = '<span class="ok">Вы вошли как ' + d.email + '</span>';
+      else who.innerHTML = '<span class="err">Токен отклонён: ' + JSON.stringify(d) + '</span>';
+    })
+    .catch(e => who.innerHTML = '<span class="err">Ошибка: ' + e.message + '</span>');
+}
+
+document.getElementById("logout").onclick = () => {
+  sessionStorage.removeItem("jwt");
+  location.href = "/login";
+};
+</script>
+</body>
+</html>

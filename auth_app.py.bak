@@ -1,0 +1,211 @@
+﻿import os
+import io
+import sqlite3
+import secrets
+import time
+import smtplib
+import base64
+from email.message import EmailMessage
+from datetime import timedelta
+
+import pyotp
+import qrcode
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required, get_jwt_identity
+)
+from flask_cors import CORS
+
+load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "auth.db")
+OTP_TTL = 600
+pending_flows = {}
+
+app = Flask(
+    __name__,
+    static_folder=os.path.join(BASE_DIR, "static"),
+    template_folder=os.path.join(BASE_DIR, "templates"),
+)
+CORS(app, supports_credentials=False)
+
+app.config["JWT_SECRET_KEY"] = os.environ["JWT_SECRET"]
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=12)
+jwt = JWTManager(app)
+
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                email TEXT PRIMARY KEY,
+                totp_secret TEXT,
+                created_at REAL
+            )
+        """)
+
+init_db()
+
+
+def get_user(email):
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT totp_secret FROM users WHERE email=?", (email,)
+        ).fetchone()
+    return {"email": email, "totp_secret": row[0] if row else None}
+
+
+def upsert_user(email, totp_secret):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO users(email, totp_secret, created_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(email) DO UPDATE SET totp_secret=excluded.totp_secret",
+            (email, totp_secret, time.time()),
+        )
+
+
+def send_otp_email(to_email, code):
+    msg = EmailMessage()
+    msg["Subject"] = "РљРѕРґ РІС…РѕРґР° РІ Motion Playground"
+    msg["From"] = os.environ["SMTP_USER"]
+    msg["To"] = to_email
+    msg.set_content(
+        f"Р’Р°С€ РєРѕРґ РґР»СЏ РІС…РѕРґР°: {code}\n"
+        f"РљРѕРґ РґРµР№СЃС‚РІСѓРµС‚ {OTP_TTL // 60} РјРёРЅСѓС‚.\n"
+        f"Р•СЃР»Рё РІС‹ РЅРµ Р·Р°РїСЂР°С€РёРІР°Р»Рё РєРѕРґ вЂ” РїСЂРѕСЃС‚Рѕ РїСЂРѕРёРіРЅРѕСЂРёСЂСѓР№С‚Рµ РїРёСЃСЊРјРѕ."
+    )
+    with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], int(os.environ["SMTP_PORT"])) as s:
+        s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+        s.send_message(msg)
+
+
+def get_flow(token):
+    f = pending_flows.get(token)
+    if not f or f["expires"] < time.time():
+        return None
+    return f
+
+
+@app.route("/")
+def root():
+    return send_from_directory(BASE_DIR, "index.html")
+
+
+@app.route("/login")
+def login_page():
+    return render_template("login.html")
+
+
+@app.route("/auth/health")
+def health():
+    return jsonify({"ok": True})
+
+
+@app.post("/auth/login/start")
+def login_start():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if "@" not in email:
+        return jsonify({"error": "invalid_email"}), 400
+
+    otp = f"{secrets.randbelow(10**6):06d}"
+    flow_token = secrets.token_urlsafe(32)
+    pending_flows[flow_token] = {
+        "email": email,
+        "otp": otp,
+        "expires": time.time() + OTP_TTL,
+        "verified": False,
+    }
+    try:
+        send_otp_email(email, otp)
+    except Exception as e:
+        app.logger.exception("SMTP error")
+        return jsonify({"error": "smtp_failed", "detail": str(e)}), 500
+
+    has_totp = bool(get_user(email)["totp_secret"])
+    return jsonify({"flow_token": flow_token, "has_totp": has_totp})
+
+
+@app.post("/auth/login/verify-email")
+def login_verify_email():
+    data = request.get_json(silent=True) or {}
+    flow = get_flow(data.get("flow_token"))
+    if not flow:
+        return jsonify({"error": "flow_expired"}), 400
+    if str(data.get("code", "")).strip() != flow["otp"]:
+        return jsonify({"error": "invalid_code"}), 401
+    flow["verified"] = True
+    return jsonify({"ok": True})
+
+
+@app.post("/auth/totp/setup")
+def totp_setup():
+    data = request.get_json(silent=True) or {}
+    flow = get_flow(data.get("flow_token"))
+    if not flow or not flow["verified"]:
+        return jsonify({"error": "email_not_verified"}), 401
+    if get_user(flow["email"])["totp_secret"]:
+        return jsonify({"error": "totp_already_set"}), 400
+
+    secret = pyotp.random_base32()
+    uri = pyotp.TOTP(secret).provisioning_uri(
+        name=flow["email"], issuer_name="Motion Playground"
+    )
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    flow["pending_secret"] = secret
+    return jsonify({
+        "otpauth_url": uri,
+        "qr_png_base64": base64.b64encode(buf.getvalue()).decode(),
+    })
+
+
+@app.post("/auth/totp/enable")
+def totp_enable():
+    data = request.get_json(silent=True) or {}
+    flow = get_flow(data.get("flow_token"))
+    if not flow or "pending_secret" not in flow:
+        return jsonify({"error": "no_pending_secret"}), 400
+
+    totp = pyotp.TOTP(flow["pending_secret"])
+    if not totp.verify(str(data.get("code", "")), valid_window=1):
+        return jsonify({"error": "invalid_totp"}), 401
+
+    upsert_user(flow["email"], flow["pending_secret"])
+    pending_flows.pop(data["flow_token"], None)
+    token = create_access_token(identity=flow["email"])
+    return jsonify({"access_token": token, "email": flow["email"]})
+
+
+@app.post("/auth/totp/verify")
+def totp_verify():
+    data = request.get_json(silent=True) or {}
+    flow = get_flow(data.get("flow_token"))
+    if not flow or not flow["verified"]:
+        return jsonify({"error": "email_not_verified"}), 401
+
+    user = get_user(flow["email"])
+    if not user["totp_secret"]:
+        return jsonify({"error": "totp_not_configured"}), 400
+
+    totp = pyotp.TOTP(user["totp_secret"])
+    if not totp.verify(str(data.get("code", "")), valid_window=1):
+        return jsonify({"error": "invalid_totp"}), 401
+
+    pending_flows.pop(data["flow_token"], None)
+    token = create_access_token(identity=flow["email"])
+    return jsonify({"access_token": token, "email": flow["email"]})
+
+
+@app.get("/auth/me")
+@jwt_required()
+def me():
+    return jsonify({"email": get_jwt_identity()})
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=True)
+

@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Вход — Motion Playground</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background:#0b1020; color:#e5e7eb;
+           display:grid; place-items:center; min-height:100vh; margin:0; }
+    .card { width:min(440px,92vw); padding:28px; border-radius:20px;
+            background:#111827; border:1px solid #1f2937; box-sizing:border-box; }
+    input, button { width:100%; padding:12px 14px; border-radius:12px; font:inherit;
+                    border:1px solid #374151; background:#0f172a; color:#e5e7eb;
+                    box-sizing:border-box; margin:8px 0; }
+    button { background:#22d3ee; color:#020617; font-weight:700; cursor:pointer;
+             border:0; transition:opacity .15s; }
+    button:hover { opacity:.9; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .hidden { display:none; }
+    .msg { font-size:14px; color:#f87171; min-height:20px; }
+    .hint { font-size:13px; color:#9ca3af; }
+    img.qr { display:block; margin:12px auto; background:#fff; padding:8px; border-radius:12px; }
+    h2 { margin:0 0 12px; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h2>Вход в Motion Playground</h2>
+  <p id="msg" class="msg"></p>
+
+  <div id="stepEmail">
+    <p class="hint">Введите email, на него придёт код подтверждения.</p>
+    <input id="email" type="email" placeholder="you@example.com" autocomplete="email">
+    <button id="sendCode">Получить код на почту</button>
+  </div>
+
+  <div id="stepEmailCode" class="hidden">
+    <p>Введите 6-значный код из письма:</p>
+    <input id="emailCode" inputmode="numeric" maxlength="6" placeholder="000000">
+    <button id="verifyEmail">Проверить</button>
+  </div>
+
+  <div id="stepTotpSetup" class="hidden">
+    <p>Первый вход. Отсканируйте QR в Google Authenticator / Authy / 1Password:</p>
+    <img id="qr" class="qr" width="220" height="220" alt="QR-код TOTP">
+    <input id="totpCodeSetup" inputmode="numeric" maxlength="6" placeholder="Код из приложения">
+    <button id="enableTotp">Включить TOTP и войти</button>
+  </div>
+
+  <div id="stepTotpVerify" class="hidden">
+    <p>Введите код из приложения-аутентификатора:</p>
+    <input id="totpCodeVerify" inputmode="numeric" maxlength="6" placeholder="000000">
+    <button id="verifyTotp">Войти</button>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const msg = t => { $("msg").textContent = t || ""; };
+let flow = null, hasTotp = false;
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {})
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ("http_" + res.status));
+  return data;
+}
+
+function show(id) {
+  ["stepEmail","stepEmailCode","stepTotpSetup","stepTotpVerify"]
+    .forEach(x => $(x).classList.toggle("hidden", x !== id));
+}
+
+$("sendCode").onclick = async () => {
+  msg(""); $("sendCode").disabled = true;
+  try {
+    const r = await api("/auth/login/start", { email: $("email").value.trim() });
+    flow = r.flow_token; hasTotp = r.has_totp;
+    show("stepEmailCode"); $("emailCode").focus();
+  } catch (e) { msg("Ошибка: " + e.message); }
+  finally { $("sendCode").disabled = false; }
+};
+
+$("verifyEmail").onclick = async () => {
+  msg(""); $("verifyEmail").disabled = true;
+  try {
+    await api("/auth/login/verify-email",
+              { flow_token: flow, code: $("emailCode").value.trim() });
+    if (hasTotp) { show("stepTotpVerify"); $("totpCodeVerify").focus(); }
+    else {
+      const r = await api("/auth/totp/setup", { flow_token: flow });
+      $("qr").src = "data:image/png;base64," + r.qr_png_base64;
+      show("stepTotpSetup"); $("totpCodeSetup").focus();
+    }
+  } catch (e) { msg("Ошибка: " + e.message); }
+  finally { $("verifyEmail").disabled = false; }
+};
+
+$("enableTotp").onclick = async () => {
+  msg(""); $("enableTotp").disabled = true;
+  try {
+    const r = await api("/auth/totp/enable",
+                        { flow_token: flow, code: $("totpCodeSetup").value.trim() });
+    sessionStorage.setItem("jwt", r.access_token);
+    location.href = "/";
+  } catch (e) { msg("Ошибка: " + e.message); }
+  finally { $("enableTotp").disabled = false; }
+};
+
+$("verifyTotp").onclick = async () => {
+  msg(""); $("verifyTotp").disabled = true;
+  try {
+    const r = await api("/auth/totp/verify",
+                        { flow_token: flow, code: $("totpCodeVerify").value.trim() });
+    sessionStorage.setItem("jwt", r.access_token);
+    location.href = "/";
+  } catch (e) { msg("Ошибка: " + e.message); }
+  finally { $("verifyTotp").disabled = false; }
+};
+
+document.querySelectorAll("input").forEach(inp => {
+  inp.addEventListener("keydown", e => {
+    if (e.key === "Enter") {
+      const step = inp.closest("div[id^=step]");
+      step.querySelector("button").click();
+    }
+  });
+});
+</script>
+</body>
+</html>
